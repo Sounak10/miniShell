@@ -27,7 +27,81 @@ func main() {
 }
 
 func handleCmd(cmd string) {
+	var outputFile string
+	var fileDescriptor int = 1
+	var appendMode bool = false
+
+	redirectPos := strings.Index(cmd, ">>")
+	if redirectPos != -1 {
+		appendMode = true
+	} else {
+
+		redirectPos = strings.Index(cmd, ">")
+	}
+
+	if redirectPos != -1 {
+
+		fdEndPos := redirectPos
+
+		if redirectPos > 0 && cmd[redirectPos-1] >= '0' && cmd[redirectPos-1] <= '9' {
+			fdStr := ""
+			i := redirectPos - 1
+
+			for i >= 0 && cmd[i] >= '0' && cmd[i] <= '9' {
+				fdStr = string(cmd[i]) + fdStr
+				i--
+			}
+
+			if fd, err := strconv.Atoi(fdStr); err == nil {
+				fileDescriptor = fd
+				fdEndPos = i + 1
+			}
+		}
+
+		redirectCmd := cmd[:fdEndPos]
+		var filenamePart string
+		if appendMode {
+
+			filenamePart = strings.TrimSpace(cmd[redirectPos+2:])
+		} else {
+			filenamePart = strings.TrimSpace(cmd[redirectPos+1:])
+		}
+
+		filename := strings.Builder{}
+		inQuotes := false
+		var quoteChar byte = 0
+
+		for i := range len(filenamePart) {
+			char := filenamePart[i]
+			if (char == '"' || char == '\'') && (i == 0 || filenamePart[i-1] != '\\') {
+				if !inQuotes {
+					inQuotes = true
+					quoteChar = char
+				} else if char == quoteChar {
+					inQuotes = false
+				} else {
+					filename.WriteByte(char)
+				}
+			} else if !inQuotes && char == ' ' {
+				if filename.Len() > 0 {
+					break
+				}
+			} else {
+				filename.WriteByte(char)
+			}
+		}
+
+		outputFile = filename.String()
+		cmd = redirectCmd
+	}
+
 	command, args := getCmdAndArgs(cmd)
+
+	if outputFile != "" {
+		executeWithRedirection(command, args, outputFile, fileDescriptor, appendMode)
+		return
+	}
+
 	if comm, ok := builtins[command]; !ok {
 		execHandler(command, args)
 	} else {
@@ -43,6 +117,81 @@ func handleCmd(cmd string) {
 		case 4:
 			cdHandler(args)
 		}
+	}
+}
+
+func executeWithRedirection(command string, args []string, outputFile string, fileDescriptor int, appendMode bool) {
+
+	var file *os.File
+	var err error
+
+	if appendMode {
+		file, err = os.OpenFile(outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	} else {
+		file, err = os.Create(outputFile)
+	}
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error opening file: %s\n", err)
+		return
+	}
+	defer file.Close()
+
+	var origStdout *os.File
+	var origStderr *os.File
+
+	switch fileDescriptor {
+	case 1:
+		origStdout = os.Stdout
+		os.Stdout = file
+	case 2:
+		origStderr = os.Stderr
+		os.Stderr = file
+	default:
+		fmt.Fprintf(os.Stderr, "Unsupported file descriptor: %d\n", fileDescriptor)
+		return
+	}
+
+	if comm, ok := builtins[command]; !ok {
+		cmd := exec.Command(command, args...)
+
+		if fileDescriptor == 1 {
+			cmd.Stdout = file
+			cmd.Stderr = os.Stderr
+		} else if fileDescriptor == 2 {
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = file
+		}
+
+		cmd.Stdin = os.Stdin
+		err := cmd.Run()
+		if err != nil {
+
+			if exitErr, ok := err.(*exec.Error); ok && exitErr.Err == exec.ErrNotFound {
+
+				fmt.Fprintf(os.Stderr, "%s: command not found\n", command)
+			}
+		}
+	} else {
+		switch comm {
+		case 0:
+			exitHandler(args)
+		case 1:
+			echoHandler(args)
+		case 2:
+			typeHandler(args)
+		case 3:
+			pwdHandler()
+		case 4:
+			cdHandler(args)
+		}
+	}
+
+	if origStdout != nil {
+		os.Stdout = origStdout
+	}
+	if origStderr != nil {
+		os.Stderr = origStderr
 	}
 }
 
@@ -105,9 +254,10 @@ func execHandler(cmd string, args []string) {
 	command.Stdin = os.Stdin
 	err := command.Run()
 	if err != nil {
-		fmt.Printf("%s: command not found\n", cmd)
+		if exitErr, ok := err.(*exec.Error); ok && exitErr.Err == exec.ErrNotFound {
+			fmt.Fprintf(os.Stderr, "%s: command not found\n", cmd)
+		}
 	}
-
 }
 
 func getCmdAndArgs(cmd string) (string, []string) {
